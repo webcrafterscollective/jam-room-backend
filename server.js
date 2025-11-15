@@ -62,6 +62,16 @@ const runtimeConfig = {
           // Music‑friendly Opus: stereo on, in‑band FEC on, DTX off to avoid cadence holes.
           parameters: { stereo: 1, useinbandfec: 1, dtx: 0 },
         },
+        {
+          kind: 'video',
+          mimeType: 'video/H264',
+          clockRate: 90000,
+          parameters: {
+            'packetization-mode': 1,
+            'profile-level-id': '42e01f', // Baseline profile, level 3.1
+            'level-asymmetry-allowed': 1,
+          },
+        },
       ],
     },
     webRtcTransport: {
