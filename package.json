@@ -1,15 +1,25 @@
 {
   "name": "jam-room-backend",
   "version": "1.0.0",
-  "main": "index.js",
+  "main": "server.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node server.js",
+    "dev": "NODE_ENV=development node server.js",
+    "pm2:start": "pm2 start ecosystem.config.js",
+    "pm2:stop": "pm2 stop jam-server",
+    "pm2:restart": "pm2 restart jam-server",
+    "pm2:logs": "pm2 logs jam-server",
+    "pm2:monit": "pm2 monit"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "description": "",
+  "description": "Production grade cascading sync music jamming server",
+  "engines": {
+    "node": ">=18.0.0"
+  },
   "dependencies": {
+    "cors": "^2.8.5",
     "express": "^5.1.0",
     "mediasoup": "^3.19.3",
     "socket.io": "^4.8.1"
