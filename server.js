@@ -8,9 +8,10 @@
  * - Lead Guitar/Vocals → locks to drummer + bassist + rhythm guitar
  * 
  * Features:
- * - Role-based musician hierarchy
- * - Per-peer latency matrix with continuous measurement
- * - Cascading metronome sync with individual offsets
+ * - Role-based musician hierarchy with REACTIVE sync
+ * - Server-mediated latency measurement (not peer-to-peer)
+ * - Recursive cascading sync offset calculation
+ * - Automatic adjustment to network condition changes
  * - Priority-based audio routing
  * - Production-grade error handling and logging
  */
@@ -27,6 +28,8 @@ const cors = require('cors');
 // ═══════════════════════════════════════════════════════════════════════════════
 // 1. CONFIGURATION
 // ═══════════════════════════════════════════════════════════════════════════════
+
+console.log(`++++++++PUBLIC IP: ${process.env.LISTEN_IP} `);
 
 const config = {
   env: process.env.NODE_ENV || 'development',
@@ -287,31 +290,26 @@ class WorkerManager {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// 4. LATENCY TRACKER
+// 4. LATENCY TRACKER (SERVER-MEDIATED, NOT PEER-TO-PEER)
 // ═══════════════════════════════════════════════════════════════════════════════
 
 class LatencyTracker {
   constructor(historySize = config.latency.historySize) {
     this.historySize = historySize;
-    // Map: peerId -> Map<targetPeerId, {samples: number[], lastUpdate: number}>
-    this.matrix = new Map();
+    // Map: peerId -> {samples: number[], lastUpdate: number}
+    this.serverLatencies = new Map();
   }
 
   /**
-   * Record a latency measurement between two peers
+   * Record a latency measurement between peer and server
+   * This is the RTT from client to server and back
    */
-  record(fromPeerId, toPeerId, rtt) {
-    if (!this.matrix.has(fromPeerId)) {
-      this.matrix.set(fromPeerId, new Map());
+  recordServerLatency(peerId, rtt) {
+    if (!this.serverLatencies.has(peerId)) {
+      this.serverLatencies.set(peerId, { samples: [], lastUpdate: 0 });
     }
     
-    const peerLatencies = this.matrix.get(fromPeerId);
-    
-    if (!peerLatencies.has(toPeerId)) {
-      peerLatencies.set(toPeerId, { samples: [], lastUpdate: 0 });
-    }
-    
-    const entry = peerLatencies.get(toPeerId);
+    const entry = this.serverLatencies.get(peerId);
     entry.samples.push(rtt);
     
     // Keep only recent samples
@@ -320,16 +318,20 @@ class LatencyTracker {
     }
     
     entry.lastUpdate = Date.now();
+    
+    logger.debug('LatencyTracker', 'Server latency recorded', {
+      peerId,
+      rtt,
+      samples: entry.samples.length
+    });
   }
 
   /**
-   * Get the estimated one-way latency from peer A to peer B
+   * Get the estimated one-way latency from peer to server (or server to peer)
+   * We assume symmetric paths, so one-way ≈ RTT/2
    */
-  getLatency(fromPeerId, toPeerId) {
-    const peerLatencies = this.matrix.get(fromPeerId);
-    if (!peerLatencies) return null;
-    
-    const entry = peerLatencies.get(toPeerId);
+  getServerLatency(peerId) {
+    const entry = this.serverLatencies.get(peerId);
     if (!entry || entry.samples.length === 0) return null;
     
     // Use median for robustness against outliers
@@ -340,13 +342,10 @@ class LatencyTracker {
   }
 
   /**
-   * Get comprehensive latency stats between two peers
+   * Get comprehensive latency stats for a peer
    */
-  getStats(fromPeerId, toPeerId) {
-    const peerLatencies = this.matrix.get(fromPeerId);
-    if (!peerLatencies) return null;
-    
-    const entry = peerLatencies.get(toPeerId);
+  getStats(peerId) {
+    const entry = this.serverLatencies.get(peerId);
     if (!entry || entry.samples.length === 0) return null;
     
     const samples = entry.samples;
@@ -364,57 +363,21 @@ class LatencyTracker {
   }
 
   /**
-   * Calculate cumulative latency through sync chain
-   * e.g., for Rhythm Guitar: latency to Drummer + latency to Bassist
+   * Get all latencies for debugging
    */
-  getCumulativeLatency(peerId, syncTargets, participants) {
-    let maxLatency = 0;
-    
-    for (const targetRole of syncTargets) {
-      // Find participant with this role
-      const targetPeer = Array.from(participants.entries())
-        .find(([_, p]) => p.role === targetRole);
-      
-      if (targetPeer) {
-        const [targetId] = targetPeer;
-        const latency = this.getLatency(peerId, targetId);
-        if (latency !== null) {
-          maxLatency = Math.max(maxLatency, latency);
-        }
-      }
+  getAllStats() {
+    const stats = {};
+    for (const [peerId, entry] of this.serverLatencies) {
+      stats[peerId] = this.getStats(peerId);
     }
-    
-    return maxLatency;
-  }
-
-  /**
-   * Get full latency matrix for a room
-   */
-  getRoomMatrix(participantIds) {
-    const matrix = {};
-    
-    for (const fromId of participantIds) {
-      matrix[fromId] = {};
-      for (const toId of participantIds) {
-        if (fromId !== toId) {
-          matrix[fromId][toId] = this.getStats(fromId, toId);
-        }
-      }
-    }
-    
-    return matrix;
+    return stats;
   }
 
   /**
    * Clean up entries for a disconnected peer
    */
   removePeer(peerId) {
-    this.matrix.delete(peerId);
-    
-    // Also remove this peer from other peers' entries
-    for (const [_, peerLatencies] of this.matrix) {
-      peerLatencies.delete(peerId);
-    }
+    this.serverLatencies.delete(peerId);
   }
 }
 
@@ -450,6 +413,10 @@ class Room {
         requireRole: true,
       }
     };
+    
+    // Cache for sync offsets to avoid excessive recalculation
+    this.syncOffsetCache = new Map();
+    this.cacheInvalidated = true;
   }
 
   /**
@@ -457,11 +424,19 @@ class Room {
    */
   addParticipant(socketId, participant) {
     this.participants.set(socketId, participant);
+    this.invalidateSyncCache();
     
     // If this is the first participant or they're a drummer, make them leader
     if (!this.metronome.leaderId || participant.role === 'DRUMMER') {
       this.promoteToLeader(socketId);
     }
+    
+    logger.info('Room', 'Participant added', {
+      roomId: this.id,
+      socketId,
+      role: participant.role,
+      totalParticipants: this.participants.size
+    });
   }
 
   /**
@@ -478,6 +453,7 @@ class Room {
     
     this.participants.delete(socketId);
     this.latencyTracker.removePeer(socketId);
+    this.invalidateSyncCache();
     
     // Handle leader succession
     if (this.metronome.leaderId === socketId) {
@@ -485,6 +461,164 @@ class Room {
     }
     
     return participant;
+  }
+
+  /**
+   * Invalidate sync offset cache when topology changes
+   */
+  invalidateSyncCache() {
+    this.cacheInvalidated = true;
+    this.syncOffsetCache.clear();
+  }
+
+  /**
+   * Calculate sync offset RECURSIVELY through the cascading chain
+   * 
+   * This is the CORE of the reactive sync system.
+   * 
+   * Formula:
+   * syncOffset[musician] = max(
+   *   for each sync_target:
+   *     syncOffset[sync_target] +           // when target plays
+   *     upload_latency[sync_target] +       // target → server
+   *     download_latency[musician]          // server → musician
+   * ) + compensation_buffer
+   * 
+   * Example:
+   * - Drummer: 0ms (no one to sync to)
+   * - Bassist syncs to drummer:
+   *   = 0ms + 20ms (drummer upload) + 30ms (bassist download) + 50ms buffer
+   *   = 100ms
+   * - Rhythm syncs to drummer + bassist:
+   *   = max(
+   *       0ms + 20ms + 25ms,      // drummer path
+   *       100ms + 30ms + 25ms     // bassist path
+   *     ) + 50ms buffer
+   *   = 155ms + 50ms = 205ms
+   */
+  calculateSyncOffset(socketId, visited = new Set()) {
+    // Check cache first
+    if (this.syncOffsetCache.has(socketId)) {
+      return this.syncOffsetCache.get(socketId);
+    }
+    
+    const participant = this.participants.get(socketId);
+    if (!participant) {
+      logger.warn('Room', 'Cannot calculate sync offset: participant not found', { socketId });
+      return 0;
+    }
+    
+    const roleConfig = config.roles[participant.role];
+    if (!roleConfig || roleConfig.syncTo.length === 0) {
+      // Base case: drummer or role with no sync targets
+      this.syncOffsetCache.set(socketId, 0);
+      return 0;
+    }
+    
+    // Detect circular dependencies
+    if (visited.has(socketId)) {
+      logger.error('Room', 'Circular dependency detected in sync chain', { socketId });
+      return 0;
+    }
+    visited.add(socketId);
+    
+    // Get this participant's download latency from server
+    const myDownloadLatency = this.latencyTracker.getServerLatency(socketId);
+    
+    if (myDownloadLatency === null) {
+      // No latency data yet, use default estimate
+      logger.debug('Room', 'No latency data, using default', { socketId });
+      this.syncOffsetCache.set(socketId, config.latency.compensationBuffer);
+      return config.latency.compensationBuffer;
+    }
+    
+    let maxArrivalTime = 0;
+    
+    for (const targetRole of roleConfig.syncTo) {
+      // Find the target participant
+      const targetEntry = Array.from(this.participants.entries())
+        .find(([_, p]) => p.role === targetRole);
+      
+      if (!targetEntry) {
+        logger.debug('Room', 'Sync target not found in room', { 
+          socketId, 
+          targetRole 
+        });
+        continue;
+      }
+      
+      const [targetId, targetParticipant] = targetEntry;
+      
+      // RECURSIVE CALL: When does the target play?
+      const targetPlayTime = this.calculateSyncOffset(targetId, new Set(visited));
+      
+      // When does target's audio reach server?
+      const targetUploadLatency = this.latencyTracker.getServerLatency(targetId);
+      
+      if (targetUploadLatency === null) {
+        logger.debug('Room', 'Target has no latency data', { targetId, targetRole });
+        continue;
+      }
+      
+      const targetAudioAtServer = targetPlayTime + targetUploadLatency;
+      
+      // When does it reach me?
+      const arrivalTime = targetAudioAtServer + myDownloadLatency;
+      
+      logger.debug('Room', 'Calculated path latency', {
+        from: socketId,
+        to: targetId,
+        targetRole,
+        targetPlayTime,
+        targetUploadLatency,
+        myDownloadLatency,
+        arrivalTime
+      });
+      
+      maxArrivalTime = Math.max(maxArrivalTime, arrivalTime);
+    }
+    
+    // Add compensation buffer for jitter and processing delays
+    const syncOffset = maxArrivalTime + config.latency.compensationBuffer;
+    
+    // Cache the result
+    this.syncOffsetCache.set(socketId, syncOffset);
+    
+    logger.debug('Room', 'Sync offset calculated', {
+      socketId,
+      role: participant.role,
+      syncOffset,
+      syncTargets: roleConfig.syncTo
+    });
+    
+    return syncOffset;
+  }
+
+  /**
+   * Recalculate and broadcast sync offsets to all participants
+   */
+  broadcastSyncOffsets(io) {
+    this.invalidateSyncCache();
+    
+    const now = Date.now();
+    
+    for (const [socketId, participant] of this.participants) {
+      const syncOffset = this.calculateSyncOffset(socketId);
+      participant.syncOffset = syncOffset;
+      
+      // Send updated offset to this participant
+      io.to(socketId).emit('syncOffsetUpdate', {
+        syncOffset,
+        serverTime: now,
+        metronome: this.metronome,
+      });
+      
+      logger.debug('Room', 'Sync offset broadcasted', {
+        socketId,
+        role: participant.role,
+        syncOffset
+      });
+    }
   }
 
   /**
@@ -524,6 +658,11 @@ class Room {
     if (!roleConfig?.canLead) return false;
     
     this.metronome.leaderId = socketId;
+    logger.info('Room', 'Leader promoted', {
+      roomId: this.id,
+      leaderId: socketId,
+      role: participant.role
+    });
     return true;
   }
 
@@ -549,27 +688,6 @@ class Room {
   }
 
   /**
-   * Calculate sync offset for a participant based on their role
-   */
-  calculateSyncOffset(socketId) {
-    const participant = this.participants.get(socketId);
-    if (!participant) return 0;
-    
-    const roleConfig = config.roles[participant.role];
-    if (!roleConfig) return 0;
-    
-    // Get cumulative latency to all sync targets
-    const latency = this.latencyTracker.getCumulativeLatency(
-      socketId,
-      roleConfig.syncTo,
-      this.participants
-    );
-    
-    // Add compensation buffer for jitter
-    return latency + config.latency.compensationBuffer;
-  }
-
-  /**
    * Get room status
    */
   getStatus() {
@@ -581,8 +699,10 @@ class Room {
         role: p.role,
         displayName: p.displayName,
         isLeader: socketId === this.metronome.leaderId,
+        syncOffset: p.syncOffset,
         producerCount: p.producers.size,
         consumerCount: p.consumers.size,
+        latencyStats: this.latencyTracker.getStats(socketId),
       });
     }
     
@@ -817,7 +937,7 @@ io.on('connection', (socket) => {
   let currentRoom = null;
 
   // ─────────────────────────────────────────────────────────────────────────────
-  // A. TIME SYNCHRONIZATION
+  // A. TIME SYNCHRONIZATION & LATENCY MEASUREMENT
   // ─────────────────────────────────────────────────────────────────────────────
 
   /**
@@ -835,70 +955,50 @@ io.on('connection', (socket) => {
   });
 
   /**
-   * Measure latency to a specific peer
-   * Used to build the latency matrix
+   * Ping server to measure latency (CLIENT → SERVER → CLIENT)
+   * This is the primary latency measurement for reactive sync
    */
-  socket.on('pingPeer', ({ targetSocketId, pingId, t0 }, callback) => {
-    if (!currentRoom) {
-      return safeCallback(callback, { error: 'Not in a room' });
-    }
-
-    const targetParticipant = currentRoom.participants.get(targetSocketId);
-    if (!targetParticipant) {
-      return safeCallback(callback, { error: 'Target peer not found' });
-    }
-
-    // Forward ping to target peer
-    io.to(targetSocketId).emit('peerPing', {
-      fromSocketId: socket.id,
+  socket.on('pingServer', ({ pingId, t0 }, callback) => {
+    const t1 = Date.now();
+    safeCallback(callback, {
       pingId,
       t0,
-    });
-
-    safeCallback(callback, { sent: true });
-  });
-
-  /**
-   * Handle pong response from peer
-   */
-  socket.on('pongPeer', ({ targetSocketId, pingId, t0 }) => {
-    if (!currentRoom) return;
-
-    // Forward pong back to original sender
-    io.to(targetSocketId).emit('peerPong', {
-      fromSocketId: socket.id,
-      pingId,
-      t0,
-      t1: Date.now(),
+      t1,
+      serverTime: t1,
     });
   });
 
   /**
-   * Record measured latency
+   * Record server RTT measurement from client
+   * This triggers recalculation of sync offsets for the entire chain
    */
-  socket.on('recordLatency', ({ targetSocketId, rtt }) => {
-    if (!currentRoom) return;
+  socket.on('recordServerLatency', ({ rtt }) => {
+    if (!currentRoom || !participant) return;
     
-    currentRoom.latencyTracker.record(socket.id, targetSocketId, rtt);
+    // Record the measurement
+    currentRoom.latencyTracker.recordServerLatency(socket.id, rtt);
     
-    // Update participant's sync offset
-    if (participant) {
-      participant.syncOffset = currentRoom.calculateSyncOffset(socket.id);
-    }
+    // Recalculate sync offsets for ALL participants in room
+    // because this participant's latency affects downstream musicians
+    currentRoom.broadcastSyncOffsets(io);
+    
+    logger.debug('Socket', 'Server latency recorded and offsets updated', {
+      socketId: socket.id,
+      rtt,
+      newOffset: participant.syncOffset
+    });
   });
 
   /**
-   * Get latency matrix for the room
+   * Get current latency stats
    */
-  socket.on('getLatencyMatrix', (_, callback) => {
+  socket.on('getLatencyStats', (_, callback) => {
     if (!currentRoom) {
       return safeCallback(callback, { error: 'Not in a room' });
     }
-
-    const participantIds = Array.from(currentRoom.participants.keys());
-    const matrix = currentRoom.latencyTracker.getRoomMatrix(participantIds);
     
-    safeCallback(callback, { matrix });
+    const stats = currentRoom.latencyTracker.getStats(socket.id);
+    safeCallback(callback, { stats });
   });
 
   // ─────────────────────────────────────────────────────────────────────────────
@@ -959,6 +1059,7 @@ io.on('connection', (socket) => {
           socketId: id,
           role: p.role,
           displayName: p.displayName,
+          syncOffset: p.syncOffset,
         }));
 
       logger.info('Room', 'Participant joined', {
@@ -984,6 +1085,7 @@ io.on('connection', (socket) => {
         metronome: currentRoom.metronome,
         isLeader: currentRoom.metronome.leaderId === socket.id,
         syncTargets: participant.getSyncTargets(),
+        syncOffset: participant.syncOffset,
         roles: config.roles,
       });
 
@@ -1023,8 +1125,8 @@ io.on('connection', (socket) => {
         currentRoom.electNewLeader();
       }
 
-      // Recalculate sync offset
-      participant.syncOffset = currentRoom.calculateSyncOffset(socket.id);
+      // Recalculate sync offsets for entire room (topology changed)
+      currentRoom.broadcastSyncOffsets(io);
 
       // Notify room
       io.to(currentRoom.id).emit('participantRoleChanged', {
@@ -1038,6 +1140,7 @@ io.on('connection', (socket) => {
         success: true,
         newRole,
         syncTargets: participant.getSyncTargets(),
+        syncOffset: participant.syncOffset,
         isLeader: currentRoom.metronome.leaderId === socket.id,
       });
 
@@ -1566,6 +1669,7 @@ io.on('connection', (socket) => {
 
   /**
    * Update metronome state (leader only)
+   * Broadcasts to all participants with their personalized sync offsets
    */
   socket.on('updateMetronome', ({ isPlaying, tempo, beatsPerMeasure }, callback) => {
     try {
@@ -1599,14 +1703,19 @@ io.on('connection', (socket) => {
 
       // Broadcast to all participants with their individual sync offsets
       for (const [socketId, p] of currentRoom.participants) {
-        const syncOffset = currentRoom.calculateSyncOffset(socketId);
-        
         io.to(socketId).emit('metronomeSync', {
           ...currentRoom.metronome,
-          syncOffset,
+          syncOffset: p.syncOffset,
           serverTime: now,
+          isLeader: socketId === currentRoom.metronome.leaderId,
         });
       }
+
+      logger.info('Metronome', 'State updated', {
+        roomId: currentRoom.id,
+        isPlaying: currentRoom.metronome.isPlaying,
+        tempo: currentRoom.metronome.tempo,
+      });
 
       safeCallback(callback, {
         success: true,
@@ -1626,11 +1735,9 @@ io.on('connection', (socket) => {
       return safeCallback(callback, { error: 'Not in a room' });
     }
 
-    const syncOffset = currentRoom.calculateSyncOffset(socket.id);
-    
     safeCallback(callback, {
       ...currentRoom.metronome,
-      syncOffset,
+      syncOffset: participant.syncOffset,
       serverTime: Date.now(),
       isLeader: currentRoom.metronome.leaderId === socket.id,
     });
@@ -1649,13 +1756,11 @@ io.on('connection', (socket) => {
     for (const [socketId, p] of currentRoom.participants) {
       if (socketId === socket.id) continue; // Don't send back to leader
       
-      const syncOffset = currentRoom.calculateSyncOffset(socketId);
-      
       io.to(socketId).emit('beatSync', {
         beatNumber,
         leaderTimestamp: timestamp,
         serverTime: Date.now(),
-        syncOffset,
+        syncOffset: p.syncOffset,
       });
     }
   });
@@ -1792,7 +1897,8 @@ io.on('connection', (socket) => {
         latencies[targetRole] = {
           socketId: targetId,
           displayName: targetParticipant.displayName,
-          stats: currentRoom.latencyTracker.getStats(socket.id, targetId),
+          syncOffset: targetParticipant.syncOffset,
+          serverLatency: currentRoom.latencyTracker.getStats(targetId),
         };
       }
     }
@@ -1800,9 +1906,10 @@ io.on('connection', (socket) => {
     safeCallback(callback, {
       role: participant.role,
       syncTargets,
-      syncOffset: currentRoom.calculateSyncOffset(socket.id),
+      syncOffset: participant.syncOffset,
       latencies,
       isLeader: currentRoom.metronome.leaderId === socket.id,
+      myServerLatency: currentRoom.latencyTracker.getStats(socket.id),
     });
   });
 
@@ -1840,6 +1947,12 @@ io.on('connection', (socket) => {
             newLeaderName: newLeader.displayName,
           });
         }
+      }
+      
+      // Recalculate sync offsets for remaining participants
+      // (topology changed due to participant leaving)
+      if (currentRoom.participants.size > 0) {
+        currentRoom.broadcastSyncOffsets(io);
       }
     }
 
