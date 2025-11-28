@@ -18,6 +18,7 @@
 
 'use strict';
 
+require('dotenv').config();
 const os = require('os');
 const http = require('http');
 const express = require('express');
