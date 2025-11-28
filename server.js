@@ -31,6 +31,7 @@ const cors = require('cors');
 // ═══════════════════════════════════════════════════════════════════════════════
 
 console.log(`++++++++PUBLIC IP: ${process.env.LISTEN_IP} `);
+console.log(`++++++++ANNOUNCE IP: ${process.env.MEDIASOUP_ANNOUNCED_IP} `);
 
 const config = {
   env: process.env.NODE_ENV || 'development',
