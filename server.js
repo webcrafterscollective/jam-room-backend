@@ -599,6 +599,34 @@ class Room {
   /**
    * Recalculate and broadcast sync offsets to all participants
    */
+  // broadcastSyncOffsets(io) {
+  //   this.invalidateSyncCache();
+    
+  //   const now = Date.now();
+    
+  //   for (const [socketId, participant] of this.participants) {
+  //     const syncOffset = this.calculateSyncOffset(socketId);
+  //     participant.syncOffset = syncOffset;
+      
+  //     // Send updated offset to this participant
+  //     io.to(socketId).emit('syncOffsetUpdate', {
+  //       syncOffset,
+  //       serverTime: now,
+  //       metronome: this.metronome,
+  //     });
+      
+  //     logger.debug('Room', 'Sync offset broadcasted', {
+  //       socketId,
+  //       role: participant.role,
+  //       syncOffset
+  //     });
+  //   }
+  // }
+
+  /**
+   * Recalculate and broadcast sync offsets to all participants
+   * UPDATED: Now calculates 'streamArrivals' for Stream Alignment
+   */
   broadcastSyncOffsets(io) {
     this.invalidateSyncCache();
     
@@ -608,17 +636,52 @@ class Room {
       const syncOffset = this.calculateSyncOffset(socketId);
       participant.syncOffset = syncOffset;
       
-      // Send updated offset to this participant
+      // ═════════════════════════════════════════════════════════════════════════
+      // NEW: Calculate expected arrival times for Stream Alignment
+      // ═════════════════════════════════════════════════════════════════════════
+      const streamArrivals = {};
+      const roleConfig = config.roles[participant.role];
+      
+      // Get my download latency (Server -> Me) to know when packets land at my client
+      const myDownloadLatency = this.latencyTracker.getServerLatency(socketId) || 0;
+
+      if (roleConfig && roleConfig.syncTo) {
+        for (const targetRole of roleConfig.syncTo) {
+          // 1. Find the specific participant playing this target role
+          const targetEntry = Array.from(this.participants.entries())
+            .find(([_, p]) => p.role === targetRole);
+          
+          if (targetEntry) {
+            const [targetId, _] = targetEntry;
+
+            // 2. When does the target play? (Their Sync Offset)
+            // Note: calculateSyncOffset uses cache, so this is efficient
+            const targetPlayTime = this.calculateSyncOffset(targetId);
+            
+            // 3. How long does it take their audio to reach the server? (Target -> Server)
+            const targetUploadLatency = this.latencyTracker.getServerLatency(targetId) || 0;
+            
+            // 4. EXPECTED ARRIVAL = Play Time + Upload Latency + My Download Latency
+            // This tells the client: "This stream will arrive at T + X ms"
+            streamArrivals[targetId] = targetPlayTime + targetUploadLatency + myDownloadLatency;
+          }
+        }
+      }
+      // ═════════════════════════════════════════════════════════════════════════
+
+      // Send updated offset AND stream arrivals to this participant
       io.to(socketId).emit('syncOffsetUpdate', {
         syncOffset,
         serverTime: now,
         metronome: this.metronome,
+        streamArrivals, // <--- PASS THIS TO FRONTEND
       });
       
       logger.debug('Room', 'Sync offset broadcasted', {
         socketId,
         role: participant.role,
-        syncOffset
+        syncOffset,
+        streamArrivals
       });
     }
   }
